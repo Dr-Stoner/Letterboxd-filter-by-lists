@@ -1,0 +1,936 @@
+// ==UserScript==
+// @name         Letterboxd Challenge List Filters
+// @namespace    local.letterboxd.challenge-list-filters
+// @version      2.0.0
+// @description  Filter the current Letterboxd listing by one or more challenge lists.
+// @match        https://letterboxd.com/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// @run-at       document-end
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const KEYS = {
+        lists: 'lbcf-list-urls',
+        // Bump the cache namespace when the page walker changes so a partial
+        // first-page result from an older version cannot be reused.
+        cache: 'lbcf-list-cache-v8',
+        mode: 'lbcf-filter-mode',
+    };
+    const FILTER_COOKIE = 'filmFilter';
+    const CHALLENGE_CATEGORY = 'challenge';
+    const CACHE_TTL_MS = 15 * 60 * 1000;
+    const MAX_LIST_PAGES = 200;
+    const MENU_LABELS = {
+        show: 'Show challenge films',
+        hide: 'Hide challenge films',
+    };
+
+    let applyQueued = false;
+    let progressRefreshQueued = false;
+
+    GM_registerMenuCommand('Manage challenge list URLs…', manageLists);
+    GM_registerMenuCommand('Refresh challenge list data', refreshLists);
+    GM_registerMenuCommand('Clear challenge filter', clearFilter);
+
+    function readValue(key, fallback) {
+        try {
+            const value = GM_getValue(key, fallback);
+            return value === undefined || value === null ? fallback : value;
+        } catch (error) {
+            console.error('[LB Challenge Filter] Could not read settings:', error);
+            return fallback;
+        }
+    }
+
+    function writeValue(key, value) {
+        try {
+            GM_setValue(key, value);
+        } catch (error) {
+            console.error('[LB Challenge Filter] Could not save settings:', error);
+            window.alert('Tampermonkey could not save this setting. Check that this userscript is enabled.');
+        }
+    }
+
+    function readNativeFilterState() {
+        const cookie = document.cookie.split(';').map((part) => part.trim())
+            .find((part) => part.startsWith(`${FILTER_COOKIE}=`));
+        if (!cookie) return {};
+
+        let value = cookie.slice(FILTER_COOKIE.length + 1);
+        try {
+            value = decodeURIComponent(value);
+        } catch (_) {
+            // Keep the raw cookie value if it contains malformed escaping.
+        }
+
+        const filters = {};
+        for (const token of value.split(/\s+/)) {
+            const divider = token.indexOf('-');
+            if (divider < 0) continue;
+            const type = token.slice(0, divider);
+            const category = token.slice(divider + 1);
+            if (category && (type === 'show' || type === 'hide')) filters[category] = type;
+        }
+        return filters;
+    }
+
+    function writeNativeFilterState(filters) {
+        const value = Object.entries(filters)
+            .map(([category, type]) => `${type}-${category}`)
+            .join(' ');
+        const encodedName = encodeURIComponent(FILTER_COOKIE);
+        const expires = value
+            ? new Date(Date.now() + 730 * 24 * 60 * 60 * 1000).toUTCString()
+            : 'Thu, 01 Jan 1970 00:00:00 GMT';
+        document.cookie = `${encodedName}=${encodeURIComponent(value)}; expires=${expires}; path=/; SameSite=Lax`;
+    }
+
+    function getChallengeMode() {
+        const mode = readValue(KEYS.mode, '');
+        return mode === 'show' || mode === 'hide' ? mode : '';
+    }
+
+    function changeChallengeMode(mode) {
+        const nextMode = getChallengeMode() === mode ? '' : mode;
+        writeValue(KEYS.mode, nextMode);
+        removeLegacyChallengeCategory();
+        window.location.reload();
+    }
+
+    function removeLegacyChallengeCategory() {
+        const filters = readNativeFilterState();
+        if (!filters[CHALLENGE_CATEGORY]) return false;
+        delete filters[CHALLENGE_CATEGORY];
+        writeNativeFilterState(filters);
+        return true;
+    }
+
+    function migrateLegacyChallengeMode() {
+        const filters = readNativeFilterState();
+        const legacyMode = filters[CHALLENGE_CATEGORY];
+        if (!legacyMode) return false;
+
+        const savedMode = readValue(KEYS.mode, null);
+        if (savedMode === null) writeValue(KEYS.mode, legacyMode);
+        delete filters[CHALLENGE_CATEGORY];
+        writeNativeFilterState(filters);
+        return true;
+    }
+
+    function normalizeListUrl(rawUrl) {
+        const url = new URL(rawUrl, location.origin);
+        if (url.origin !== location.origin || !url.pathname.includes('/list/')) {
+            throw new Error('Use a full Letterboxd list URL, such as https://letterboxd.com/username/list/list-name/.');
+        }
+
+        url.pathname = url.pathname.replace(/\/detail\/?$/, '/')
+            .replace(/\/page\/\d+\/?$/, '/')
+            .replace(/\/+$/, '/') || '/';
+        url.search = '';
+        url.hash = '';
+        return url.href;
+    }
+
+    function manageLists() {
+        if (document.getElementById('lbcf-url-manager')) return;
+
+        const overlay = document.createElement('div');
+        overlay.id = 'lbcf-url-manager';
+        overlay.setAttribute('role', 'presentation');
+        overlay.style.cssText = 'position: fixed; inset: 0; z-index: 2147483647; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(0, 0, 0, 0.68);';
+
+        const panel = document.createElement('section');
+        panel.setAttribute('role', 'dialog');
+        panel.setAttribute('aria-modal', 'true');
+        panel.setAttribute('aria-labelledby', 'lbcf-manager-title');
+        panel.style.cssText = 'box-sizing: border-box; width: min(620px, 100%); max-height: min(80vh, 700px); overflow: hidden; display: flex; flex-direction: column; gap: 14px; padding: 20px; color: #f5f7fa; background: #2c3440; border: 1px solid rgba(255,255,255,.18); border-radius: 8px; box-shadow: 0 12px 40px rgba(0,0,0,.45); font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;';
+
+        const heading = document.createElement('div');
+        heading.style.cssText = 'display: flex; align-items: center; justify-content: space-between; gap: 12px;';
+        const title = document.createElement('h2');
+        title.id = 'lbcf-manager-title';
+        title.textContent = 'Challenge list URLs';
+        title.style.cssText = 'margin: 0; font-size: 20px;';
+        const closeButton = createManagerButton('Close');
+        closeButton.setAttribute('aria-label', 'Close challenge list URL manager');
+        heading.append(title, closeButton);
+
+        const description = document.createElement('p');
+        description.textContent = 'Add lists one at a time or remove an individual list. Films from the saved lists are combined.';
+        description.style.cssText = 'margin: 0; color: #c6cbd2;';
+
+        const addRow = document.createElement('div');
+        addRow.style.cssText = 'display: flex; gap: 8px;';
+        const input = document.createElement('input');
+        input.type = 'url';
+        input.placeholder = 'https://letterboxd.com/username/list/list-name/';
+        input.setAttribute('aria-label', 'Letterboxd list URL');
+        input.style.cssText = 'box-sizing: border-box; min-width: 0; flex: 1; padding: 10px 12px; color: #14181c; background: #fff; border: 1px solid #9da7b1; border-radius: 4px; font: inherit;';
+        const addButton = createManagerButton('Add URL', true);
+        addRow.append(input, addButton);
+
+        const message = document.createElement('div');
+        message.setAttribute('aria-live', 'polite');
+        message.style.cssText = 'min-height: 1.4em; color: #ffd166;';
+
+        const list = document.createElement('ul');
+        list.setAttribute('aria-label', 'Saved challenge list URLs');
+        list.style.cssText = 'list-style: none; margin: 0; padding: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;';
+
+        panel.append(heading, description, addRow, message, list);
+        overlay.append(panel);
+        document.body.append(overlay);
+
+        function saveUrls(urls) {
+            writeValue(KEYS.lists, urls);
+            writeValue(KEYS.cache, {});
+            if (!urls.length) {
+                writeValue(KEYS.mode, '');
+                const filters = readNativeFilterState();
+                delete filters[CHALLENGE_CATEGORY];
+                writeNativeFilterState(filters);
+            }
+            queueApply();
+        }
+
+        function renderList() {
+            const urls = readValue(KEYS.lists, []);
+            const savedUrls = Array.isArray(urls) ? urls : [];
+            list.replaceChildren();
+
+            if (!savedUrls.length) {
+                const empty = document.createElement('li');
+                empty.textContent = 'No challenge lists added yet.';
+                empty.style.cssText = 'padding: 12px; color: #c6cbd2; border: 1px dashed rgba(255,255,255,.25); border-radius: 4px;';
+                list.append(empty);
+                return;
+            }
+
+            savedUrls.forEach((url, index) => {
+                const row = document.createElement('li');
+                row.style.cssText = 'display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; background: rgba(255,255,255,.07); border-radius: 4px;';
+                const value = document.createElement('span');
+                value.textContent = url;
+                value.style.cssText = 'min-width: 0; overflow-wrap: anywhere;';
+                const removeButton = createManagerButton('Remove');
+                removeButton.setAttribute('aria-label', `Remove ${url}`);
+                removeButton.addEventListener('click', () => {
+                    const latest = readValue(KEYS.lists, []);
+                    const updated = Array.isArray(latest) ? latest.filter((_, currentIndex) => currentIndex !== index) : [];
+                    saveUrls(updated);
+                    message.textContent = 'List removed.';
+                    renderList();
+                });
+                row.append(value, removeButton);
+                list.append(row);
+            });
+        }
+
+        function addUrl() {
+            message.textContent = '';
+            let normalized;
+            try {
+                normalized = normalizeListUrl(input.value.trim());
+            } catch (error) {
+                message.textContent = error.message;
+                input.focus();
+                return;
+            }
+
+            const current = readValue(KEYS.lists, []);
+            const urls = Array.isArray(current) ? current : [];
+            if (urls.includes(normalized)) {
+                message.textContent = 'That list is already saved.';
+                input.focus();
+                return;
+            }
+
+            saveUrls([...urls, normalized]);
+            input.value = '';
+            message.textContent = 'List added.';
+            renderList();
+            input.focus();
+        }
+
+        function closeManager() {
+            overlay.remove();
+        }
+
+        addButton.addEventListener('click', addUrl);
+        closeButton.addEventListener('click', closeManager);
+        input.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                addUrl();
+            }
+        });
+        overlay.addEventListener('click', (event) => {
+            if (event.target === overlay) closeManager();
+        });
+        panel.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') closeManager();
+        });
+
+        renderList();
+        input.focus();
+    }
+
+    function createManagerButton(label, primary = false) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = label;
+        button.style.cssText = `flex: 0 0 auto; padding: 9px 12px; color: ${primary ? '#14181c' : '#f5f7fa'}; background: ${primary ? '#00c030' : 'rgba(255,255,255,.08)'}; border: 1px solid ${primary ? '#00c030' : 'rgba(255,255,255,.3)'}; border-radius: 4px; cursor: pointer; font: inherit; font-weight: 600;`;
+        return button;
+    }
+
+    async function refreshLists() {
+        writeValue(KEYS.cache, {});
+        const listUrls = readValue(KEYS.lists, []);
+        if (!Array.isArray(listUrls) || !listUrls.length) {
+            window.alert('Add one or more challenge list URLs before refreshing list data.');
+            return;
+        }
+
+        try {
+            const films = await loadCombinedFilmSet(listUrls);
+            const mode = getChallengeMode();
+            if (mode) applyFilter(films, mode);
+            window.alert(`Challenge list data refreshed (${films.size} unique films).`);
+        } catch (error) {
+            showStatus(`Challenge filter could not load a list: ${error.message}`);
+            window.alert(`Could not refresh challenge list data. ${error.message}`);
+        }
+    }
+
+    function clearFilter() {
+        writeValue(KEYS.mode, '');
+        removeLegacyChallengeCategory();
+        window.location.reload();
+    }
+
+    function setFilter(mode) {
+        const urls = readValue(KEYS.lists, []);
+        if (!Array.isArray(urls) || !urls.length) {
+            window.alert('Add one or more challenge list URLs from the Tampermonkey menu first.');
+            return;
+        }
+        changeChallengeMode(mode);
+    }
+
+    function queueApply() {
+        if (applyQueued) return;
+        applyQueued = true;
+        window.setTimeout(() => {
+            applyQueued = false;
+            applyConfiguredFilter();
+        }, 0);
+    }
+
+    function queueProgressRefresh() {
+        if (progressRefreshQueued || !getChallengeMode()) return;
+        progressRefreshQueued = true;
+        window.setTimeout(() => {
+            progressRefreshQueued = false;
+            if (!getChallengeMode()) return;
+
+            const visibleCards = findPosterCards(document).filter((card) => {
+                if (card.hidden || card.style.display === 'none' || card.getAttribute('data-lbcf-hidden') === 'true') return false;
+                return window.getComputedStyle(card).display !== 'none';
+            });
+            updateProgressSummary(visibleCards);
+        }, 40);
+    }
+
+    function getMainListingScope() {
+        if (!document.body || document.body.classList.contains('film-page') || /^\/film\//.test(location.pathname)) {
+            return null;
+        }
+
+        const hasNativeWatchlistOption = [...document.querySelectorAll('a')]
+            .some((link) => link.textContent.trim() === 'Show films in watchlist');
+        if (!document.body.classList.contains('list-page') && !hasNativeWatchlistOption) return null;
+        return document.querySelector('#content section.col-main, #content .col-main');
+    }
+
+    async function applyConfiguredFilter() {
+        if (!getMainListingScope()) {
+            restoreFilteredCards();
+            restoreResultsMessage();
+            restoreProgressSummary();
+            return;
+        }
+
+        const mode = getChallengeMode();
+        const listUrls = readValue(KEYS.lists, []);
+        if (!mode || !Array.isArray(listUrls) || !listUrls.length) {
+            applyFilter(new Set(), '');
+            return;
+        }
+
+        try {
+            const films = await loadCombinedFilmSet(listUrls);
+            applyFilter(films, mode);
+        } catch (error) {
+            console.error('[LB Challenge Filter] Could not load challenge lists:', error);
+            restoreFilteredCards();
+            restoreResultsMessage();
+            restoreProgressSummary();
+            updateMenuState(mode);
+            showStatus(`Challenge filter could not load a list: ${error.message}`);
+        }
+    }
+
+    function restoreFilteredCards() {
+        document.querySelectorAll('[data-lbcf-hidden="true"]').forEach((card) => {
+            card.style.display = card.getAttribute('data-lbcf-original-display') || '';
+            card.hidden = card.getAttribute('data-lbcf-original-hidden') === 'true';
+            card.removeAttribute('data-lbcf-hidden');
+        });
+    }
+
+    async function loadCombinedFilmSet(listUrls) {
+        const cache = readValue(KEYS.cache, {});
+        const updatedCache = cache && typeof cache === 'object' ? { ...cache } : {};
+        const combined = new Set();
+
+        for (const listUrl of listUrls) {
+            const cached = updatedCache[listUrl];
+            let slugs;
+            if (cached && Array.isArray(cached.films) && Date.now() - cached.savedAt < CACHE_TTL_MS) {
+                slugs = cached.films;
+            } else {
+                slugs = await fetchListFilms(listUrl);
+                updatedCache[listUrl] = { films: slugs, savedAt: Date.now() };
+            }
+            for (const slug of slugs) combined.add(slug);
+        }
+
+        writeValue(KEYS.cache, updatedCache);
+        return combined;
+    }
+
+    async function fetchListFilms(listUrl) {
+        const base = new URL(listUrl);
+        const filmSlugs = new Set();
+        let pageNumber = 1;
+        let lastPageNumber = 1;
+
+        while (pageNumber <= MAX_LIST_PAGES) {
+            const pageUrl = pageNumber === 1
+                ? base.href
+                : new URL(`${base.pathname.replace(/\/+$/, '')}/page/${pageNumber}/`, base.origin).href;
+            const response = await fetch(pageUrl, {
+                credentials: 'same-origin',
+                headers: { Accept: 'text/html,application/xhtml+xml' },
+            });
+            if (pageNumber > 1 && response.status === 404 && pageNumber > lastPageNumber) break;
+            if (!response.ok) throw new Error(`Letterboxd returned ${response.status} for ${base.pathname}`);
+            if (new URL(response.url).pathname.includes('/sign-in')) {
+                throw new Error(`Letterboxd redirected to sign-in for ${base.pathname}. Make sure the list is public or visible to your account.`);
+            }
+
+            const html = await response.text();
+            let page = new DOMParser().parseFromString(html, 'text/html');
+            let pageFilms = extractFilmSlugs(page);
+            const fetchedPath = normalizePagePath(new URL(pageUrl).pathname);
+            const currentPath = location.origin === base.origin ? normalizePagePath(location.pathname) : '';
+            if (!pageFilms.length && currentPath && currentPath === fetchedPath) {
+                page = document;
+                pageFilms = extractFilmSlugs(page);
+            }
+
+            const discoveredLastPage = findLastListPage(page, base);
+            if (discoveredLastPage > lastPageNumber) lastPageNumber = discoveredLastPage;
+            if (!pageFilms.length && pageNumber <= lastPageNumber) {
+                const pageTitle = page.querySelector('title')?.textContent.trim() || 'unknown page';
+                throw new Error(`Letterboxd page ${pageNumber} of ${lastPageNumber} had no recognizable film cards (received “${pageTitle}” at ${response.url}).`);
+            }
+            if (pageNumber > 1 && pageFilms.length && pageFilms.every((slug) => filmSlugs.has(slug))) {
+                throw new Error(`Letterboxd returned the same films for page ${pageNumber}. Try refreshing the page and list data.`);
+            }
+            for (const slug of pageFilms) filmSlugs.add(slug);
+
+            // When Letterboxd's pagination links are missing from the fetched
+            // markup, keep walking pages while a page is full. Check this case
+            // before the known-last-page check so page 1 does not stop at 100.
+            if (lastPageNumber > 1) {
+                if (pageNumber >= lastPageNumber) break;
+            } else if (pageFilms.length < 100) {
+                break;
+            }
+            pageNumber += 1;
+        }
+
+        if (pageNumber > MAX_LIST_PAGES) {
+            throw new Error(`This list exceeds the ${MAX_LIST_PAGES}-page safety limit; no partial result was cached.`);
+        }
+
+        if (!filmSlugs.size) {
+            throw new Error(`No films were found. Make sure the list is visible to your Letterboxd account: ${base.href}`);
+        }
+        return [...filmSlugs];
+    }
+
+    function normalizePagePath(pathname) {
+        return pathname.replace(/\/+$/, '/') || '/';
+    }
+
+    function findLastListPage(root, base) {
+        const basePath = base.pathname.replace(/\/detail\/?$/, '').replace(/\/+$/, '');
+        const pagePrefix = `${basePath}/page/`;
+        let lastPage = 1;
+
+        for (const link of root.querySelectorAll('a[href]')) {
+            try {
+                const url = new URL(link.getAttribute('href'), base.href);
+                if (url.origin !== base.origin || !url.pathname.startsWith(pagePrefix)) continue;
+                const pageText = url.pathname.slice(pagePrefix.length).replace(/\/detail\/?$/, '').replace(/\/+$/, '');
+                if (/^\d+$/.test(pageText)) lastPage = Math.max(lastPage, Number(pageText));
+            } catch (_) {
+                // Ignore unrelated or malformed links in the page.
+            }
+        }
+        return lastPage;
+    }
+
+    function extractFilmSlugs(root) {
+        const content = root.querySelector('#content');
+        const listRoot = content || root.body || root;
+        const posterLists = [...listRoot.querySelectorAll('ul.poster-list, .poster-list')];
+        const posterListResults = posterLists
+            .map((posterList) => collectFilmSlugs(posterList))
+            .sort((left, right) => right.size - left.size);
+
+        // A page can contain an empty poster-list before the actual list grid.
+        // Inspect every candidate and use the one with the most film cards.
+        if (posterListResults[0]?.size) return [...posterListResults[0]];
+
+        const contentSlugs = collectFilmSlugs(content || listRoot);
+        if (contentSlugs.size) return [...contentSlugs];
+
+        // Last resort for Letterboxd layouts whose card markup is outside the
+        // usual content container. This is only used when scoped parsing found
+        // nothing, so unrelated film links do not get mixed into valid lists.
+        return [...collectFilmSlugs(root.body || root)];
+    }
+
+    function collectFilmSlugs(scope) {
+        const slugs = new Set();
+        if (!scope?.querySelectorAll) return slugs;
+
+        for (const node of scope.querySelectorAll('[data-film-slug], [data-item-slug]')) {
+            const slug = node.getAttribute('data-film-slug') || node.getAttribute('data-item-slug');
+            if (slug) slugs.add(slug.trim());
+        }
+
+        // Some Letterboxd layouts expose the film route on an anchor instead of
+        // a slug attribute. Static list HTML uses data-item-link before the
+        // browser turns that value into a clickable anchor.
+        for (const link of scope.querySelectorAll('a[href*="/film/"], [data-item-link*="/film/"]')) {
+            const href = link.getAttribute('href') || link.getAttribute('data-item-link') || '';
+            const match = href.match(/\/film\/([^/?#]+)/);
+            if (match) slugs.add(decodeURIComponent(match[1]));
+        }
+
+        return slugs;
+    }
+
+    function applyFilter(filmSlugs, mode) {
+        const cards = findPosterCards(document);
+        const visibleCards = [];
+        for (const card of cards) {
+            const slug = getCardFilmSlug(card);
+            if (!slug) continue;
+
+            if (!card.hasAttribute('data-lbcf-original-display')) {
+                card.setAttribute('data-lbcf-original-display', card.style.display || '');
+            }
+            if (!card.hasAttribute('data-lbcf-original-hidden')) {
+                card.setAttribute('data-lbcf-original-hidden', card.hidden ? 'true' : 'false');
+            }
+
+            const inChallenge = filmSlugs.has(slug);
+            const shouldHide = mode === 'show' ? !inChallenge : mode === 'hide' && inChallenge;
+            if (shouldHide) {
+                card.style.display = 'none';
+                card.setAttribute('data-lbcf-hidden', 'true');
+            } else {
+                card.style.display = card.getAttribute('data-lbcf-original-display') || '';
+                card.hidden = card.getAttribute('data-lbcf-original-hidden') === 'true';
+                card.removeAttribute('data-lbcf-hidden');
+                if (card.style.display !== 'none' && !card.hidden) visibleCards.push(card);
+            }
+        }
+        const status = document.getElementById('lbcf-status');
+        if (status) status.remove();
+        if (mode) {
+            updateResultsMessage(visibleCards.length);
+            updateProgressSummary(visibleCards);
+        } else {
+            restoreResultsMessage();
+            restoreProgressSummary();
+        }
+        updateMenuState(mode);
+    }
+
+    function findPosterCards(root) {
+        const scope = getMainListingScope();
+        if (!scope) return [];
+
+        const knownCards = [...scope.querySelectorAll([
+            'ul.poster-list > li.posteritem',
+            'ul.poster-list > li.poster-container',
+            '.poster-list .poster-container',
+            '.js-list-detailed-entry',
+        ].join(', '))].filter((card) => getCardFilmSlug(card));
+        if (knownCards.length) return knownCards;
+
+        const posterList = scope.querySelector('ul.poster-list');
+        if (!posterList) return [];
+        return [...posterList.children].filter((child) => getCardFilmSlug(child));
+    }
+
+    function getCardFilmSlug(card) {
+        const slugNode = card.matches('[data-film-slug], [data-item-slug]')
+            ? card
+            : card.querySelector('[data-film-slug], [data-item-slug]');
+        const dataSlug = slugNode && (slugNode.getAttribute('data-film-slug') || slugNode.getAttribute('data-item-slug'));
+        if (dataSlug) return dataSlug.trim();
+
+        const itemLinkNode = card.matches('[data-item-link]') ? card : card.querySelector('[data-item-link]');
+        const itemLink = itemLinkNode?.getAttribute('data-item-link') || '';
+        const itemLinkMatch = itemLink.match(/\/film\/([^/?#]+)/);
+        if (itemLinkMatch) return decodeURIComponent(itemLinkMatch[1]);
+
+        const filmLink = [...card.querySelectorAll('a[href]')]
+            .find((link) => /\/film\/[^/?#]+/.test(link.getAttribute('href') || ''));
+        const match = filmLink && filmLink.getAttribute('href').match(/\/film\/([^/?#]+)/);
+        return match ? decodeURIComponent(match[1]) : '';
+    }
+
+    function findNativeResultsMessage() {
+        if (!getMainListingScope()) return null;
+        // Letterboxd can place its native notice outside .col-main, depending
+        // on the list layout. Search the page while limiting this behavior to
+        // list pages (film pages have no main listing scope).
+        const root = document.body;
+
+        const candidates = [...root.querySelectorAll('*')]
+            .filter((element) => {
+                if (element.id === 'lbcf-results-status' || element.querySelector('#lbcf-results-status')) return false;
+                const text = normalizeFilterText(element.innerText || element.textContent || '');
+                const hasRemoveLink = [...element.querySelectorAll('a')]
+                    .some((link) => /remove filters/i.test(normalizeFilterText(link.innerText || link.textContent || '')));
+                return text.length < 240 && /films? in this list matching your filters/i.test(text) &&
+                    hasRemoveLink && element.getClientRects().length > 0;
+            })
+            .sort((left, right) => normalizeFilterText(left.innerText || left.textContent || '').length -
+                normalizeFilterText(right.innerText || right.textContent || '').length);
+        return candidates[0] || null;
+    }
+
+    function normalizeFilterText(text) {
+        return text.replace(/[\u00a0\u202f]/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function getListingAnchor() {
+        const scope = getMainListingScope();
+        if (!scope) return null;
+        if (/\/detail\/?$/.test(location.pathname)) {
+            return scope.querySelector('.js-list-detailed-entry');
+        }
+        return scope.querySelector('ul.poster-list') || scope.querySelector('.js-list-detailed-entry');
+    }
+
+    function createResultsMessage() {
+        document.querySelectorAll('#lbcf-results-status').forEach((existing) => existing.remove());
+        const message = document.createElement('section');
+        message.id = 'lbcf-results-status';
+        message.className = 'ui-block-header filtered-message body-text -small';
+        message.setAttribute('role', 'status');
+        const content = document.createElement('p');
+        content.className = 'ui-block-heading';
+        message.append(content);
+        const anchor = getListingAnchor();
+        if (anchor?.parentElement) anchor.parentElement.insertBefore(message, anchor);
+        return message;
+    }
+
+    function setResultsMessageContent(message, count) {
+        if (!message.__lbcfOriginalHtml) message.__lbcfOriginalHtml = message.innerHTML;
+        const sentence = count === 1
+            ? 'There is 1 film in this list matching your filters. '
+            : `There are ${count} films in this list matching your filters. `;
+        const content = message.querySelector('.ui-block-heading') || message;
+        const removeLink = content.querySelector('a.js-film-filter-remover') || document.createElement('a');
+        removeLink.classList.add('js-film-filter-remover');
+        if (!removeLink.hasAttribute('href')) removeLink.href = '#';
+        removeLink.textContent = 'Remove filters';
+        content.replaceChildren(document.createTextNode(sentence), removeLink, document.createTextNode('.'));
+    }
+
+    function updateResultsMessage(count) {
+        const scope = getMainListingScope();
+        let message = findNativeResultsMessage();
+        const customMessage = document.getElementById('lbcf-results-status');
+        if (message && customMessage) customMessage.remove();
+        if (!message) {
+            const existing = customMessage;
+            if (existing && !scope?.contains(existing)) existing.remove();
+            message = document.getElementById('lbcf-results-status') || createResultsMessage();
+        }
+        if (message) setResultsMessageContent(message, count);
+    }
+
+    function restoreResultsMessage() {
+        const message = document.getElementById('lbcf-results-status');
+        if (message) message.remove();
+
+        const nativeMessage = findNativeResultsMessage();
+        if (nativeMessage?.__lbcfOriginalHtml) {
+            nativeMessage.innerHTML = nativeMessage.__lbcfOriginalHtml;
+            delete nativeMessage.__lbcfOriginalHtml;
+        }
+    }
+
+    function isCardWatched(card) {
+        const watchedNodes = [
+            ...(card.matches('[data-watched]') ? [card] : []),
+            ...card.querySelectorAll('[data-watched]'),
+        ];
+        const watchedValues = watchedNodes.map((node) => (node.getAttribute('data-watched') || '').toLowerCase());
+        if (watchedValues.some((value) => ['true', '1', 'yes'].includes(value))) return true;
+
+        // Letterboxd often omits data-watched on lazy poster tiles. A positive
+        // account rating still means the film has been watched, including when
+        // only a filtered subset of the list remains visible.
+        const ratingNode = card.matches('[data-owner-rating]')
+            ? card
+            : card.closest('[data-owner-rating]') || card.querySelector('[data-owner-rating]');
+        const ownerRating = Number(ratingNode?.getAttribute('data-owner-rating'));
+        if (Number.isFinite(ownerRating) && ownerRating > 0) return true;
+
+        const watchButton = card.querySelector('.watch-link[aria-label]');
+        if (watchButton && /you (?:have )?watched/i.test(watchButton.getAttribute('aria-label') || '')) return true;
+        if (card.matches('.watched, .-watched') || card.querySelector('.watched, .-watched')) return true;
+        if (watchedValues.some((value) => ['false', '0', 'no'].includes(value))) return false;
+        return false;
+    }
+
+    function updateProgressSummary(visibleCards) {
+        for (const panel of document.querySelectorAll('.progress-panel')) {
+            const progressCounter = panel.querySelector('.progress-counter');
+            const percentage = panel.querySelector('.progress-percentage');
+            const bar = panel.querySelector('.progress-bar');
+            const progressContainer = panel.querySelector('.progress-container');
+            if (!progressCounter || !percentage) continue;
+
+            if (!panel.__lbcfOriginalSummary) {
+                const summaryText = progressCounter.textContent || '';
+                const totalMatches = [...summaryText.matchAll(/\/\s*([\d,]+)\s*(?:films?\s*)?total/gi)];
+                const fullTotal = totalMatches.length
+                    ? Number(totalMatches[totalMatches.length - 1][1].replace(/,/g, ''))
+                    : Number(panel.getAttribute('data-total')) || visibleCards.length;
+                panel.__lbcfOriginalSummary = {
+                    count: panel.getAttribute('data-count'),
+                    total: panel.getAttribute('data-total'),
+                    fullTotal,
+                    progressCounterHtml: progressCounter.innerHTML,
+                    percentageHtml: percentage.innerHTML,
+                    barWidth: bar?.style.width || '',
+                    progressContainerClass: progressContainer?.className || '',
+                };
+            }
+
+            const watchedCount = visibleCards.filter(isCardWatched).length;
+            const filteredCount = visibleCards.length;
+            const total = panel.__lbcfOriginalSummary.fullTotal || filteredCount;
+            const percentValue = filteredCount ? Math.round((watchedCount / filteredCount) * 100) : 0;
+
+            panel.setAttribute('data-count', String(watchedCount));
+            // The progress panel now describes the filtered set, so its native
+            // completion styling must use that set as the denominator too.
+            // Keep the unfiltered list total in the text below for context.
+            panel.setAttribute('data-total', String(filteredCount));
+            const count = document.createElement('span');
+            count.className = 'js-progress-count';
+            count.textContent = String(watchedCount);
+            const countLine = document.createElement('span');
+            countLine.className = 'progress-count';
+            countLine.append(count, document.createTextNode(` of ${filteredCount}`));
+            progressCounter.replaceChildren(countLine);
+            if (filteredCount !== total) progressCounter.append(document.createTextNode(` / ${total} total`));
+            percentage.textContent = String(percentValue);
+            if (bar) bar.style.width = `${percentValue}%`;
+            progressContainer?.classList.toggle('zero-count', watchedCount === 0);
+        }
+    }
+
+    function restoreProgressSummary() {
+        for (const panel of document.querySelectorAll('.progress-panel')) {
+            const original = panel.__lbcfOriginalSummary;
+            if (!original) continue;
+            if (original.count === null) panel.removeAttribute('data-count');
+            else panel.setAttribute('data-count', original.count);
+            if (original.total === null) panel.removeAttribute('data-total');
+            else panel.setAttribute('data-total', original.total);
+            const progressCounter = panel.querySelector('.progress-counter');
+            const percentage = panel.querySelector('.progress-percentage');
+            const bar = panel.querySelector('.progress-bar');
+            const progressContainer = panel.querySelector('.progress-container');
+            if (progressCounter) progressCounter.innerHTML = original.progressCounterHtml;
+            if (percentage) percentage.innerHTML = original.percentageHtml;
+            if (bar) bar.style.width = original.barWidth;
+            if (progressContainer) progressContainer.className = original.progressContainerClass;
+            delete panel.__lbcfOriginalSummary;
+        }
+    }
+
+    function updateMenuState(mode) {
+        document.body.classList.add('show-hide-toggle');
+        document.querySelectorAll('[data-lbcf-mode]').forEach((link) => {
+            const isActive = link.getAttribute('data-lbcf-mode') === mode;
+            const row = link.closest('li');
+            if (isActive) link.setAttribute('aria-current', 'true');
+            else link.removeAttribute('aria-current');
+            link.setAttribute('data-toggle', isActive ? 'on' : 'off');
+            row?.classList.toggle('smenu-subselected', isActive);
+        });
+    }
+
+    function showStatus(message) {
+        const scope = getMainListingScope();
+        if (!scope) return;
+        let status = document.getElementById('lbcf-status');
+        if (!status) {
+            status = document.createElement('div');
+            status.id = 'lbcf-status';
+            status.style.cssText = 'margin: 0.75em 0; padding: 0.6em 0.8em; background: #ffcc00; color: #14181c; border-radius: 3px; font: 14px/1.4 sans-serif;';
+            const anchor = getListingAnchor();
+            if (anchor?.parentElement) anchor.parentElement.insertBefore(status, anchor);
+        }
+        if (status) status.textContent = message;
+    }
+
+    function insertFilterOptions() {
+        if (!getMainListingScope()) return;
+        updateMenuState(getChallengeMode());
+
+        const links = [...document.querySelectorAll('a')];
+        const showWatchlist = links.find((link) => link.textContent.trim() === 'Show films in watchlist');
+        const hideWatchlist = links.find((link) => link.textContent.trim() === 'Hide films in watchlist');
+        if (!showWatchlist || !hideWatchlist) return;
+
+        const watchlistRow = hideWatchlist.closest('li');
+        const showChallenge = document.querySelector('[data-lbcf-row="show"]');
+        const hideChallenge = document.querySelector('[data-lbcf-row="hide"]');
+        const correctlyGrouped = watchlistRow && showChallenge && hideChallenge &&
+            showChallenge.parentElement === watchlistRow.parentElement &&
+            hideChallenge.parentElement === watchlistRow.parentElement &&
+            watchlistRow.nextElementSibling === showChallenge &&
+            showChallenge.nextElementSibling === hideChallenge &&
+            showChallenge.classList.contains('divider-line') &&
+            showChallenge.classList.contains('-inset');
+        if (correctlyGrouped) {
+            updateMenuState(getChallengeMode());
+            return;
+        }
+
+        document.querySelectorAll('[data-lbcf-divider], [data-lbcf-row]').forEach((element) => element.remove());
+        document.querySelectorAll('a[data-lbcf-mode]').forEach((link) => {
+            if (!link.closest('[data-lbcf-row]')) link.remove();
+        });
+
+        const showRow = createFilterRow('show');
+        const hideRow = createFilterRow('hide');
+        watchlistRow.insertAdjacentElement('afterend', showRow);
+        showRow.insertAdjacentElement('afterend', hideRow);
+        updateMenuState(getChallengeMode());
+    }
+
+    function createFilterRow(mode) {
+        const row = document.createElement('li');
+        row.className = mode === 'show'
+            ? 'js-film-filter divider-line -inset'
+            : 'js-film-filter';
+        row.dataset.category = CHALLENGE_CATEGORY;
+        row.dataset.type = mode;
+        row.dataset.lbcfRow = mode;
+
+        const link = document.createElement('a');
+        link.className = 'item';
+        link.href = '#';
+        link.dataset.lbcfMode = mode;
+        link.dataset.toggle = 'off';
+        link.append(document.createElement('i'));
+        link.firstElementChild.className = 'ir s icon';
+        link.append(document.createTextNode(MENU_LABELS[mode]));
+        row.append(link);
+        return row;
+    }
+
+    document.addEventListener('click', (event) => {
+        const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+        const removeLink = target?.closest('.js-film-filter-remover');
+        if (!removeLink || !getChallengeMode()) return;
+
+        // Letterboxd's native remover clears every account filter. Do the same
+        // when the custom category is active so it cannot remain selected.
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        writeValue(KEYS.mode, '');
+        writeNativeFilterState({});
+        window.location.reload();
+    }, true);
+
+    document.addEventListener('click', (event) => {
+        const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+        const link = target?.closest('a[data-lbcf-mode]');
+        if (!link) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        setFilter(link.getAttribute('data-lbcf-mode'));
+    }, true);
+
+    const legacyChallengeWasMigrated = migrateLegacyChallengeMode();
+    if (legacyChallengeWasMigrated) {
+        let shouldReload = false;
+        try {
+            const guardKey = 'lbcf-legacy-cookie-cleanup';
+            shouldReload = sessionStorage.getItem(guardKey) !== '1';
+            if (shouldReload) sessionStorage.setItem(guardKey, '1');
+        } catch (_) {
+            // Continue without a reload if this browser blocks session storage.
+        }
+        if (shouldReload) {
+            window.location.reload();
+            return;
+        }
+    }
+
+    const menuObserver = new MutationObserver((mutations) => {
+        insertFilterOptions();
+        const watchedStateChanged = mutations.some((mutation) => {
+            if (mutation.type === 'attributes') return mutation.attributeName === 'data-watched';
+            const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
+            return Boolean(target?.closest('ul.poster-list, .js-list-detailed-entry'));
+        });
+        if (watchedStateChanged) queueProgressRefresh();
+    });
+    menuObserver.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['data-watched'],
+    });
+
+    insertFilterOptions();
+    queueApply();
+})();
